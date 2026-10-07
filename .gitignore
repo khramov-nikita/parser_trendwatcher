@@ -4,3 +4,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .Python
+
+# Локальный журнал — не в GitHub
+ЖУРНАЛ_РАЗРАБОТКИ.md
