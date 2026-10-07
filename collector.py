@@ -1,4 +1,4 @@
-"""RSS collector: sources (Supabase) → events."""
+"""Collector: sources (Supabase) → events (rss / sitemap)."""
 
 from __future__ import annotations
 
@@ -6,14 +6,17 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from typing import Any, Callable
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import feedparser
 import httpx
 from dotenv import load_dotenv
+
+from settings import SITEMAP_EXCLUDE_SUBSTRINGS
 
 TRACKING_PARAMS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
 YOUTUBE_CHANNEL_RE = re.compile(
@@ -432,7 +435,7 @@ def collect_youtube_api(channel_id: str, api_key: str) -> list[dict[str, Any]]:
     return rows
 
 
-def collect_feed(feed_url: str, youtube_api_key: str = "") -> list[dict[str, Any]]:
+def collect_rss_source(feed_url: str, youtube_api_key: str = "") -> list[dict[str, Any]]:
     channel_id = youtube_channel_id(feed_url)
     try:
         return collect_rss(feed_url)
@@ -445,6 +448,151 @@ def collect_feed(feed_url: str, youtube_api_key: str = "") -> list[dict[str, Any
             if youtube_api_key:
                 return collect_youtube_api(channel_id, youtube_api_key)
             raise RuntimeError(f"{rss_error}; {page_error}") from page_error
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _parse_sitemap_lastmod(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 10 and text[4] == "-" and text[7] == "-":
+            dt = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except ValueError:
+        return None
+
+
+def title_from_sitemap_url(url: str) -> str:
+    """Последний осмысленный фрагмент path (в sitemap нет заголовков)."""
+    path = unquote(urlparse(url).path).strip("/")
+    if not path:
+        return urlparse(url).netloc or url
+    parts = [p for p in path.split("/") if p]
+    for part in reversed(parts):
+        if part.lower() in {"index.html", "index.htm", "index.php"}:
+            continue
+        if part.isdigit():
+            continue
+        return part.replace("-", " ").replace("_", " ").strip() or part
+    return parts[-1]
+
+
+def is_sitemap_excluded(url: str) -> bool:
+    haystack = (urlparse(url).path + "?" + urlparse(url).query).lower()
+    return any(token in haystack for token in SITEMAP_EXCLUDE_SUBSTRINGS)
+
+
+def _iter_sitemap_children(root: ET.Element) -> list[tuple[str, str | None]]:
+    """Возвращает список (loc, lastmod) из urlset или loc вложенных карт из sitemapindex."""
+    kind = _xml_local(root.tag)
+    rows: list[tuple[str, str | None]] = []
+    if kind == "sitemapindex":
+        for node in root:
+            if _xml_local(node.tag) != "sitemap":
+                continue
+            loc = None
+            for child in node:
+                if _xml_local(child.tag) == "loc" and child.text:
+                    loc = child.text.strip()
+            if loc:
+                rows.append((loc, None))
+        return rows
+    if kind == "urlset":
+        for node in root:
+            if _xml_local(node.tag) != "url":
+                continue
+            loc = None
+            lastmod = None
+            for child in node:
+                name = _xml_local(child.tag)
+                if name == "loc" and child.text:
+                    loc = child.text.strip()
+                elif name == "lastmod" and child.text:
+                    lastmod = child.text.strip()
+            if loc:
+                rows.append((loc, lastmod))
+        return rows
+    raise RuntimeError(f"неизвестный корень sitemap: {kind}")
+
+
+def _fetch_sitemap_xml(url: str) -> ET.Element:
+    response = HTTP.get(url)
+    if response.status_code != 200:
+        raise RuntimeError(f"sitemap HTTP {response.status_code}")
+    text = response.text.lstrip()
+    if text.lower().startswith("<!doctype") or text.lower().startswith("<html"):
+        raise RuntimeError("sitemap вернул HTML вместо XML")
+    try:
+        return ET.fromstring(response.content)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"sitemap XML parse error: {exc}") from exc
+
+
+def collect_sitemap(sitemap_url: str) -> list[dict[str, Any]]:
+    """Разбор sitemap / sitemapindex (вложенные карты — не глубже одного уровня)."""
+    root = _fetch_sitemap_xml(sitemap_url)
+    kind = _xml_local(root.tag)
+    page_entries: list[tuple[str, str | None]] = []
+
+    if kind == "sitemapindex":
+        child_maps = _iter_sitemap_children(root)
+        for child_url, _ in child_maps:
+            child_root = _fetch_sitemap_xml(child_url)
+            if _xml_local(child_root.tag) == "sitemapindex":
+                # глубже одного уровня не идём
+                continue
+            page_entries.extend(_iter_sitemap_children(child_root))
+    else:
+        page_entries = _iter_sitemap_children(root)
+
+    collected_at = iso_now()
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for loc, lastmod in page_entries:
+        url = normalize_url(loc)
+        if not url or url in seen:
+            continue
+        if is_sitemap_excluded(url):
+            continue
+        seen.add(url)
+        rows.append(
+            {
+                "url": url,
+                "title": title_from_sitemap_url(url),
+                # lastmod кладём в published_at только как дату из карты, если есть.
+                # На новизну события не влияет — её даёт UNIQUE(url).
+                "published_at": _parse_sitemap_lastmod(lastmod),
+                "collected_at": collected_at,
+                "metrics": None,
+            }
+        )
+    return rows
+
+
+def collect_source(
+    kind: str,
+    source_url: str,
+    *,
+    youtube_api_key: str = "",
+) -> list[dict[str, Any]]:
+    collectors: dict[str, Callable[..., list[dict[str, Any]]]] = {
+        "rss": lambda: collect_rss_source(source_url, youtube_api_key),
+        "sitemap": lambda: collect_sitemap(source_url),
+    }
+    collector = collectors.get(kind)
+    if collector is None:
+        raise RuntimeError(f"неподдерживаемый kind={kind!r}")
+    return collector()
 
 
 class Supabase:
@@ -462,13 +610,13 @@ class Supabase:
     def close(self) -> None:
         self._client.close()
 
-    def list_rss_sources(self) -> list[dict[str, Any]]:
+    def list_enabled_sources(self) -> list[dict[str, Any]]:
         response = self._client.get(
             f"{self._rest}/sources",
             params={
-                "select": "id,url,consecutive_errors",
+                "select": "id,url,kind,consecutive_errors",
                 "enabled": "eq.true",
-                "kind": "eq.rss",
+                "kind": "in.(rss,sitemap)",
                 "order": "id.asc",
             },
         )
@@ -499,6 +647,28 @@ class Supabase:
         return len(data) if isinstance(data, list) else 0
 
 
+def preview_sitemap(db: Supabase) -> int:
+    """Обработать один sitemap-источник и показать 10 адресов без записи в БД."""
+    sources = [
+        s for s in db.list_enabled_sources() if s.get("kind") == "sitemap"
+    ]
+    if not sources:
+        print("Нет источников kind=sitemap с enabled=true", file=sys.stderr)
+        return 1
+    source = sources[0]
+    source_url = source["url"]
+    print(f"preview sitemap id={source['id']} url={source_url}")
+    items = collect_sitemap(source_url)
+    print(f"found={len(items)} (в базу не пишем)")
+    for index, item in enumerate(items[:10], start=1):
+        print(
+            f"{index}. {item['url']}"
+            f"  title={item['title']!r}"
+            f"  lastmod={item['published_at']}"
+        )
+    return 0
+
+
 def main() -> int:
     load_dotenv()
     base_url = os.getenv("SUPABASE_URL", "").strip()
@@ -509,11 +679,20 @@ def main() -> int:
         return 1
 
     db = Supabase(base_url, key)
+
+    if "--preview-sitemap" in sys.argv:
+        try:
+            code = preview_sitemap(db)
+        finally:
+            db.close()
+            HTTP.close()
+        return code
+
     total_found = 0
     total_written = 0
 
     try:
-        sources = db.list_rss_sources()
+        sources = db.list_enabled_sources()
     except httpx.HTTPError as exc:
         print(f"Failed to load sources: {exc}", file=sys.stderr)
         db.close()
@@ -521,8 +700,8 @@ def main() -> int:
 
     if not sources:
         print(
-            "No RSS sources: table sources has no rows with enabled=true and kind='rss'. "
-            "Run db/002_sources.sql."
+            "No sources: table sources has no rows with enabled=true "
+            "and kind in (rss, sitemap)."
         )
         db.close()
         print("total_sources=0 found=0 written=0")
@@ -530,13 +709,18 @@ def main() -> int:
 
     for source in sources:
         source_id = source["id"]
-        feed_url = source["url"]
+        source_url = source["url"]
+        kind = source.get("kind") or "rss"
         errors = int(source.get("consecutive_errors") or 0)
         fetched_at = iso_now()
 
         try:
             db.patch_source(source_id, {"last_fetched_at": fetched_at})
-            items = collect_feed(feed_url, youtube_api_key)
+            items = collect_source(
+                kind,
+                source_url,
+                youtube_api_key=youtube_api_key,
+            )
             rows = [{**item, "source_id": source_id} for item in items]
             written = db.insert_events(rows)
             db.patch_source(
@@ -547,7 +731,7 @@ def main() -> int:
                 },
             )
             found = len(items)
-            print(f"{feed_url}  found={found}  written={written}")
+            print(f"{source_url}  kind={kind}  found={found}  written={written}")
             total_found += found
             total_written += written
         except Exception as exc:  # noqa: BLE001 — per-source report, continue
@@ -558,7 +742,7 @@ def main() -> int:
                 )
             except httpx.HTTPError:
                 pass
-            print(f"{feed_url}  found=0  written=0  error={exc}")
+            print(f"{source_url}  kind={kind}  found=0  written=0  error={exc}")
 
     db.close()
     HTTP.close()
